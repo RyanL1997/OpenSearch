@@ -17,6 +17,7 @@ import org.opensearch.tasks.TaskManager;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
 import org.opensearch.wlm.WlmMode;
+import org.opensearch.wlm.WorkloadGroupActionNotifier;
 import org.opensearch.wlm.WorkloadGroupLevelResourceUsageView;
 import org.opensearch.wlm.WorkloadGroupTask;
 import org.opensearch.wlm.WorkloadGroupsStateAccessor;
@@ -65,6 +66,7 @@ public class WorkloadGroupTaskCancellationService {
     Map<String, WorkloadGroupLevelResourceUsageView> workloadGroupLevelResourceUsageViews;
     private final WorkloadGroupsStateAccessor workloadGroupStateAccessor;
     private final SetOnce<TaskManager> taskManager = new SetOnce<>();
+    private final SetOnce<WorkloadGroupActionNotifier> actionNotifier = new SetOnce<>();
 
     public WorkloadGroupTaskCancellationService(
         WorkloadManagementSettings workloadManagementSettings,
@@ -76,6 +78,14 @@ public class WorkloadGroupTaskCancellationService {
         this.taskSelectionStrategy = taskSelectionStrategy;
         this.resourceUsageTrackerService = resourceUsageTrackerService;
         this.workloadGroupStateAccessor = workloadGroupStateAccessor;
+    }
+
+    /**
+     * Late-binds the node-local action notifier, which is created ahead of plugin components so that plugins
+     * can obtain it from the component registry. Can be set only once.
+     */
+    public void setActionNotifier(WorkloadGroupActionNotifier actionNotifier) {
+        this.actionNotifier.set(actionNotifier);
     }
 
     /** Late-binds the {@link TaskManager}, which is owned by the transport service built after this one. Can be set only once. */
@@ -259,8 +269,12 @@ public class WorkloadGroupTaskCancellationService {
                 throw new IllegalStateException("TaskManager must be bound before cancelling tasks");
             }
             // Cancel descendants too, so a cancelled coordinator task doesn't leave its shard tasks running on other nodes.
+            final WorkloadGroupActionNotifier notifier = this.actionNotifier.get();
             cancellationConsumer = (taskCancellation -> {
                 cancellationLoggingConsumer.accept(taskCancellation);
+                if (notifier != null && taskCancellation.getTask() instanceof WorkloadGroupTask workloadGroupTask) {
+                    notifier.notifyCancelled(workloadGroupTask.getWorkloadGroupId(), workloadGroupTask.getId());
+                }
                 taskCancellation.cancelTaskAndDescendants(taskManager);
             });
         }

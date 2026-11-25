@@ -75,6 +75,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     private final WorkloadGroupsStateAccessor workloadGroupsStateAccessor;
     // Node-local in-flight counters per throttle bucket.
     private final WorkloadGroupThrottleTracker throttleTracker = new WorkloadGroupThrottleTracker();
+    private volatile WorkloadGroupActionNotifier actionNotifier;
     private volatile WorkloadGroupSharedThrottleService sharedThrottleService;
     // Whether any workload group in the applied cluster state configures throttling; see isThrottlingActive.
     private volatile boolean throttlingConfigured;
@@ -334,6 +335,11 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         optionalWorkloadGroup.ifPresent(workloadGroup -> {
             boolean reject = false;
             final StringBuilder reason = new StringBuilder();
+            // Captured for the action notifier. The loop breaks on the first breaching resource,
+            // so these hold that resource and the limit it breached.
+            final ResourceType[] breachedResource = new ResourceType[1];
+            final double[] breachedThreshold = new double[1];
+            final double[] breachedUsage = new double[1];
             for (ResourceType resourceType : TRACKED_RESOURCES) {
                 if (workloadGroup.getResourceLimits().containsKey(resourceType)) {
                     final double threshold = getNormalisedRejectionThreshold(
@@ -343,6 +349,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                     final double lastRecordedUsage = workloadGroupState.getResourceState().get(resourceType).getLastRecordedUsage();
                     if (threshold < lastRecordedUsage) {
                         reject = true;
+                        breachedResource[0] = resourceType;
+                        breachedThreshold[0] = threshold;
+                        breachedUsage[0] = lastRecordedUsage;
                         reason.append(resourceType)
                             .append(" limit is breaching for workload group ")
                             .append(workloadGroup.get_id())
@@ -361,11 +370,30 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             }
             if (reject) {
                 workloadGroupState.totalRejections.inc();
+                final WorkloadGroupActionNotifier notifier = actionNotifier;
+                if (notifier != null) {
+                    notifier.notifyRejected(
+                        workloadGroupId,
+                        workloadGroup.getResiliencyMode().toString(),
+                        breachedResource[0] == null ? null : breachedResource[0].toString(),
+                        breachedThreshold[0],
+                        breachedUsage[0]
+                    );
+                }
                 throw new OpenSearchRejectedExecutionException(
                     "WorkloadGroup " + workloadGroupId + " is already contended. " + reason.toString()
                 );
             }
         });
+    }
+
+    /**
+     * Late-binds the node-local action notifier. It is created before plugin components are built, so
+     * plugins can obtain it from the component registry, and handed to this service afterwards.
+     */
+    public void setActionNotifier(WorkloadGroupActionNotifier actionNotifier) {
+        this.actionNotifier = actionNotifier;
+        taskCancellationService.setActionNotifier(actionNotifier);
     }
 
     /** Late-binds the cluster-level ({@code shared_limit}) tier, which needs the transport service built after this one. */
