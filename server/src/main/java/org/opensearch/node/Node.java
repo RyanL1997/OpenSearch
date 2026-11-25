@@ -324,6 +324,7 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.usage.UsageService;
 import org.opensearch.watcher.ResourceWatcherService;
+import org.opensearch.wlm.WorkloadGroupActionNotifier;
 import org.opensearch.wlm.WorkloadGroupSearchAdmission;
 import org.opensearch.wlm.WorkloadGroupSearchCancelAfterTimeIntervalResolver;
 import org.opensearch.wlm.WorkloadGroupService;
@@ -1214,6 +1215,10 @@ public class Node implements Closeable {
             final DefaultPluginComponentRegistry pluginComponentRegistry = new DefaultPluginComponentRegistry();
             pluginComponentRegistry.register(new FieldFilterProvider(indicesService.getFieldFilter()));
             pluginComponentRegistry.register(dataFormatRegistry);
+            // Created here, ahead of plugin components, so plugins can obtain it from the registry.
+            // Handed to the workload management services once those are built.
+            final WorkloadGroupActionNotifier workloadGroupActionNotifier = new WorkloadGroupActionNotifier();
+            pluginComponentRegistry.register(workloadGroupActionNotifier);
             final List<Object> pluginComponents = new ArrayList<>();
             for (Plugin p : pluginsService.filterPlugins(Plugin.class)) {
                 Collection<Object> components = p.createComponents(
@@ -1312,6 +1317,7 @@ public class Node implements Closeable {
                 workloadManagementSettings,
                 workloadGroupsStateAccessor
             );
+            workloadGroupService.setActionNotifier(workloadGroupActionNotifier);
             taskResourceTrackingService.addTaskCompletionListener(workloadGroupService);
 
             final WorkloadGroupRequestOperationListener workloadGroupRequestOperationListener = new WorkloadGroupRequestOperationListener(

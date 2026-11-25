@@ -43,10 +43,12 @@ import org.opensearch.wlm.stats.WorkloadGroupState;
 import org.opensearch.wlm.tracker.WorkloadGroupResourceUsageTrackerService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -511,6 +513,151 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
                 .get(ResourceType.MEMORY).rejections.count()
         );
         assertEquals(1, workloadGroupState.totalRejections.count());
+    }
+
+    public void testRejectIfNeeded_notifiesListenerWithBreachedResource() {
+        WorkloadGroup testWorkloadGroup = new WorkloadGroup(
+            "testWorkloadGroup",
+            "workloadGroupId1",
+            new MutableWorkloadGroupFragment(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED, Map.of(ResourceType.CPU, 0.10)),
+            1L
+        );
+        Set<WorkloadGroup> activeWorkloadGroups = new HashSet<>() {
+            {
+                add(testWorkloadGroup);
+            }
+        };
+        mockWorkloadGroupStateMap = new HashMap<>();
+        WorkloadGroupState workloadGroupState = new WorkloadGroupState();
+        workloadGroupState.getResourceState().get(ResourceType.CPU).setLastRecordedUsage(0.18);
+        mockWorkloadGroupsStateAccessor = new WorkloadGroupsStateAccessor(mockWorkloadGroupStateMap);
+        mockWorkloadGroupStateMap.put("workloadGroupId1", workloadGroupState);
+
+        workloadGroupService = new WorkloadGroupService(
+            mockCancellationService,
+            mockClusterService,
+            mockThreadPool,
+            mockWorkloadManagementSettings,
+            mockNodeDuressTrackers,
+            mockWorkloadGroupsStateAccessor,
+            activeWorkloadGroups,
+            new HashSet<>()
+        );
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        when(mockWorkloadManagementSettings.getNodeLevelCpuRejectionThreshold()).thenReturn(0.8);
+
+        List<WorkloadGroupActionNotifier.Action> observed = new ArrayList<>();
+        WorkloadGroupActionNotifier notifier = new WorkloadGroupActionNotifier();
+        notifier.addListener(observed::add);
+        workloadGroupService.setActionNotifier(notifier);
+
+        assertThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.rejectIfNeeded("workloadGroupId1"));
+
+        assertEquals(1, observed.size());
+        WorkloadGroupActionNotifier.Action action = observed.get(0);
+        assertEquals(WorkloadGroupActionNotifier.Kind.REJECTED, action.kind());
+        assertEquals("workloadGroupId1", action.workloadGroupId());
+        assertEquals(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED.toString(), action.resiliencyMode());
+        assertEquals(ResourceType.CPU.toString(), action.resourceType());
+        assertEquals(0.18, action.observedUsage(), 0.0);
+        assertEquals(-1L, action.taskId());
+    }
+
+    public void testRejectIfNeeded_doesNotNotifyWhenNotBreaching() {
+        WorkloadGroup testWorkloadGroup = new WorkloadGroup(
+            "testWorkloadGroup",
+            "workloadGroupId1",
+            new MutableWorkloadGroupFragment(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED, Map.of(ResourceType.CPU, 0.10)),
+            1L
+        );
+        Set<WorkloadGroup> activeWorkloadGroups = new HashSet<>() {
+            {
+                add(testWorkloadGroup);
+            }
+        };
+        mockWorkloadGroupStateMap = new HashMap<>();
+        WorkloadGroupState workloadGroupState = new WorkloadGroupState();
+        workloadGroupState.getResourceState().get(ResourceType.CPU).setLastRecordedUsage(0.01);
+        mockWorkloadGroupsStateAccessor = new WorkloadGroupsStateAccessor(mockWorkloadGroupStateMap);
+        mockWorkloadGroupStateMap.put("workloadGroupId1", workloadGroupState);
+
+        workloadGroupService = new WorkloadGroupService(
+            mockCancellationService,
+            mockClusterService,
+            mockThreadPool,
+            mockWorkloadManagementSettings,
+            mockNodeDuressTrackers,
+            mockWorkloadGroupsStateAccessor,
+            activeWorkloadGroups,
+            new HashSet<>()
+        );
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        when(mockWorkloadManagementSettings.getNodeLevelCpuRejectionThreshold()).thenReturn(0.8);
+
+        List<WorkloadGroupActionNotifier.Action> observed = new ArrayList<>();
+        WorkloadGroupActionNotifier notifier = new WorkloadGroupActionNotifier();
+        notifier.addListener(observed::add);
+        workloadGroupService.setActionNotifier(notifier);
+
+        workloadGroupService.rejectIfNeeded("workloadGroupId1");
+
+        assertTrue(observed.isEmpty());
+    }
+
+    public void testActionNotifierListenerFailureDoesNotSuppressRejection() {
+        WorkloadGroup testWorkloadGroup = new WorkloadGroup(
+            "testWorkloadGroup",
+            "workloadGroupId1",
+            new MutableWorkloadGroupFragment(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED, Map.of(ResourceType.CPU, 0.10)),
+            1L
+        );
+        Set<WorkloadGroup> activeWorkloadGroups = new HashSet<>() {
+            {
+                add(testWorkloadGroup);
+            }
+        };
+        mockWorkloadGroupStateMap = new HashMap<>();
+        WorkloadGroupState workloadGroupState = new WorkloadGroupState();
+        workloadGroupState.getResourceState().get(ResourceType.CPU).setLastRecordedUsage(0.18);
+        mockWorkloadGroupsStateAccessor = new WorkloadGroupsStateAccessor(mockWorkloadGroupStateMap);
+        mockWorkloadGroupStateMap.put("workloadGroupId1", workloadGroupState);
+
+        workloadGroupService = new WorkloadGroupService(
+            mockCancellationService,
+            mockClusterService,
+            mockThreadPool,
+            mockWorkloadManagementSettings,
+            mockNodeDuressTrackers,
+            mockWorkloadGroupsStateAccessor,
+            activeWorkloadGroups,
+            new HashSet<>()
+        );
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        when(mockWorkloadManagementSettings.getNodeLevelCpuRejectionThreshold()).thenReturn(0.8);
+
+        WorkloadGroupActionNotifier notifier = new WorkloadGroupActionNotifier();
+        notifier.addListener(action -> { throw new RuntimeException("listener boom"); });
+        workloadGroupService.setActionNotifier(notifier);
+
+        // The breaker-style contract: a failing listener is logged and the original rejection still surfaces.
+        assertThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.rejectIfNeeded("workloadGroupId1"));
+    }
+
+    public void testActionNotifierListenerRemoval() {
+        List<WorkloadGroupActionNotifier.Action> observed = new ArrayList<>();
+        java.util.function.Consumer<WorkloadGroupActionNotifier.Action> listener = observed::add;
+
+        WorkloadGroupActionNotifier notifier = new WorkloadGroupActionNotifier();
+        notifier.addListener(listener);
+        notifier.notifyCancelled("workloadGroupId1", 42L);
+        assertEquals(1, observed.size());
+        assertEquals(WorkloadGroupActionNotifier.Kind.CANCELLED, observed.get(0).kind());
+        assertEquals(42L, observed.get(0).taskId());
+        assertNull(observed.get(0).resourceType());
+
+        notifier.removeListener(listener);
+        notifier.notifyCancelled("workloadGroupId1", 43L);
+        assertEquals(1, observed.size());
     }
 
     public void testRejectIfNeeded_whenFeatureIsNotEnabled() {
